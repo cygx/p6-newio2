@@ -175,7 +175,8 @@ my class NewIO::BufferedOsHandle is NewIO::OsHandle does NewIO::BufferedHandle {
     }
 }
 
-my class NewIO::StreamingOsHandle is NewIO::BufferedOsHandle does NewIO::StreamingHandle {}
+my class NewIO::StreamingOsHandle is NewIO::BufferedOsHandle
+    does NewIO::StreamingHandle {}
 
 my class NewIO::FileHandle is NewIO::BufferedOsHandle {
     has Str $.path;
