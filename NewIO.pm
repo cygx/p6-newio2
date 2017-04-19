@@ -1,12 +1,14 @@
 use NativeCall;
 
+my role NewIO { ... }
+
 my class X::NewIO::Sys does X::IO {
     method message {
         "system error: $!os-error";
     }
 }
 
-my class sysio {
+my class NewIO::Sys {
     my constant NUL = "\0";
     my constant ENC = 'utf16';
     my constant INVALID-FD = -1;
@@ -15,6 +17,12 @@ my class sysio {
     sub sysio_error(buf8, uint64 --> uint64) is native<sysio> {*}
     sub sysio_open(Str is encoded(ENC), uint64 --> int64) is native<sysio> {*}
     sub sysio_stdhandle(uint32 --> int64) is native<sysio> {*}
+    sub sysio_read(int64, buf8, uint64, uint64 --> int64) is native<sysio> {*}
+    sub sysio_copy(buf8, blob8, uint64, uint64, uint64) is native<sysio> {*}
+    sub sysio_move(buf8, blob8, uint64, uint64, uint64) is native<sysio> {*}
+    sub sysio_getsize(int64 --> int64) is native<sysio> {*}
+    sub sysio_getpos(int64 --> int64) is native<sysio> {*}
+    sub sysio_close(int64 --> int64) is native<sysio> {*}
 
     method mode(
         :$r, :$u, :$w, :$a, :$x, :$ru, :$rw, :$ra, :$rx,
@@ -32,6 +40,14 @@ my class sysio {
         $read = $write = $create = $exclusive = True if $rx;
         ?$read +| ?$write +< 1 +| ?$append +< 2
             +| ?$create +< 3 +| ?$exclusive +< 4 +| ?$truncate +< 5;
+    }
+
+    method read(int64 $fd, buf8:D $buf, uint64 $offset, uint64 $count --> int64) {
+        my int64 $read = sysio_read($fd, $buf, $offset, $count);
+        die X::NewIO::Sys.new(os-error => self.error)
+            if $read < 0;
+
+        $read;
     }
 
     method error(--> Str:D) {
@@ -58,11 +74,47 @@ my class sysio {
     multi method stdhandle(:$out!) { 1 }
     multi method stdhandle(:$err!) { 2 }
     multi method stdhandle(:$in?)  { 0 }
+
+    method copy(buf8:D $dst, blob8:D $src,
+        uint64 $dstpos, uint64 $srcpos, uint64 $count --> Nil) {
+        sysio_copy($dst, $src, $dstpos, $srcpos, $count);
+    }
+
+    method move(buf8:D $dst, blob8:D $src,
+        uint64 $dstpos, uint64 $srcpos, uint64 $count --> Nil) {
+        sysio_move($dst, $src, $dstpos, $srcpos, $count);
+    }
+
+    method getsize(int64 $fd --> int64) {
+        my int64 $size = sysio_getsize($fd);
+        die X::NewIO::Sys.new(os-error => self.error)
+            if $size < 0;
+
+        $size;
+    }
+
+    method getpos(int64 $fd --> int64) {
+        my int64 $pos = sysio_getpos($fd);
+        die X::NewIO::Sys.new(os-error => self.error)
+            if $pos < 0;
+
+        $pos;
+    }
+
+    method close(int64 $fd --> Nil) {
+        my int64 $rv = sysio_close($fd);
+        die X::NewIO::Sys.new(os-error => self.error)
+            if $rv < 0;
+    }
 }
 
-my role NewIO { ... }
+my constant sysio = NewIO::Sys;
 
 my role NewIO::Handle {
+    method raw(--> NewIO::Handle:D) {
+        self.RAW;
+    }
+
     method close(--> True) {
         self.CLOSE;
     }
@@ -93,6 +145,10 @@ my role NewIO::Handle {
         my $buf := buf8.allocate($n);
         $buf.reallocate(self.READ($buf, 0, $n));
         $buf;
+    }
+
+    method readall(--> blob8:D) {
+        self.read(self.GET-SIZE - self.GET-POS);
     }
 }
 
@@ -160,11 +216,39 @@ my class NewIO::OsHandle does NewIO::Handle {
     has int64 $.fd;
 
     method SET($!fd) {}
+
+    method RAW { self }
+
+    method CLOSE {
+        sysio.close($!fd);
+    }
+
+    method READ(buf8:D $buf, UInt:D $offset, UInt:D $count --> UInt:D) {
+        sysio.read($!fd, $buf, $offset, $count);
+    }
+
+    method GET-SIZE {
+        sysio.getsize($!fd);
+    }
+
+    method GET-POS {
+        sysio.getpos($!fd);
+    }
 }
 
 my class NewIO::BufferedOsHandle is NewIO::OsHandle does NewIO::BufferedHandle {
-    has buf8 $!buffer;
+    my constant BLOCKSIZE = 512;
+
+    sub round-to-block(uint $n, uint $s = BLOCKSIZE) {
+        (($n + $s - 1) div $s) * $s;
+    }
+
+    has buf8 $!buffer = buf8.allocate(BLOCKSIZE);
     has uint $!pos;
+
+    method RAW {
+        NewIO::OsHandle.new(:$.fd);
+    }
 
     method AVAILABLE-BYTES {
         $!pos;
@@ -172,6 +256,30 @@ my class NewIO::BufferedOsHandle is NewIO::OsHandle does NewIO::BufferedHandle {
 
     method CLEAR-BUFFER {
         $!pos = 0;
+    }
+
+    method FILL-BUFFER(UInt:D $n --> Nil) {
+        if $n > $!pos {
+            my uint $size = $!buffer.elems;
+            my uint $want = round-to-block $n;
+            $!buffer.reallocate($want)
+                if $want > $size;
+
+            $!pos = $!pos + self.READ($!buffer, $!pos, $want - $!pos);
+        }
+    }
+
+    method TAKE-AVAILABLE-BYTES(UInt:D $n --> blob8:D) {
+        my uint $count = $n min $!pos;
+        my uint $rest = $!pos - $count;
+
+        my $buf := buf8.allocate($count);
+        sysio.copy($buf, $!buffer, 0, 0, $count);
+        sysio.move($!buffer, $!buffer, 0, $count, $rest)
+            if $rest > 0;
+
+        $!pos = $rest;
+        $buf;
     }
 }
 
@@ -201,21 +309,41 @@ my role NewIO[NewIO::Handle:U \HANDLE] {
     }
 
     method IO { self }
+
+    proto method slurp {*}
+    multi method slurp(:$bin! --> blob8:D) {
+        my \handle = self.open(|%_);
+        LEAVE handle.close;
+        handle.readall;
+    }
+    multi method slurp(:$uni! --> Uni:D) {
+        my \handle = self.open(|%_);
+        LEAVE handle.close;
+        handle.unireadall;
+    }
+    multi method slurp(--> Str:D) {
+        my \handle = self.open(|%_);
+        LEAVE handle.close;
+        handle.readallchars;
+    }
 }
 
 my class NewIO::Std does NewIO[NewIO::StdHandle] {}
 
-my class NewIO::Path is IO::Path does NewIO[NewIO::FileHandle] {}
+my class NewIO::Path is IO::Path does NewIO[NewIO::FileHandle] {
+    multi method slurp(:$bin! --> blob8:D) {
+        my \fd = sysio.open(self.absolute, 0);
+        my \size = sysio.getsize(fd);
+        my \buf = buf8.allocate(size);
+        buf.reallocate(sysio.read(fd, buf, 0, size));
+        sysio.close(fd);
+        buf;
+    }
+}
 
 proto sub open2($?, *%) {*}
-
-multi sub open2(Cool $_, *%_) {
-    NewIO::Path.new($_).open(|%_);
-}
-
-multi sub open2(IO() $_ = NewIO::Std, *%_) {
-    .open(|%_);
-}
+multi sub open2(Cool $_, *%_) { NewIO::Path.new($_).open(|%_) }
+multi sub open2(IO() $_ = NewIO::Std, *%_) { .open(|%_)}
 
 my $patched = False;
 

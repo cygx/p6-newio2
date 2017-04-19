@@ -1,4 +1,4 @@
-all: .dummy sysio.dll
+all: sysio.dll .dummy
 
 .dummy: NewIO.pm
 	perl6 -I. -MNewIO -e 'use NewIO 1'
