@@ -206,7 +206,13 @@ my class NewIO::Std does NewIO[NewIO::StdHandle] {}
 
 my class NewIO::Path is IO::Path does NewIO[NewIO::FileHandle] {}
 
-sub newio-open(IO() $_ = NewIO::Std, *%_) {
+proto sub open2($?, *%) {*}
+
+multi sub open2(Cool $_, *%_) {
+    NewIO::Path.new($_).open(|%_);
+}
+
+multi sub open2(IO() $_ = NewIO::Std, *%_) {
     .open(|%_);
 }
 
@@ -217,13 +223,13 @@ sub EXPORT(Int $patch = 0) {
         if !$patched {
             Str.^find_method('IO').wrap(method { NewIO::Path.new(self) });
             IO::Path.^find_method('open').wrap(NewIO::Path.^find_method('open'));
-            &open.wrap(&newio-open);
+            &open.wrap(&open2);
             $patched = True;
         }
 
-        BEGIN Map.new((IO => NewIO, '&open' => &newio-open));
+        BEGIN Map.new((IO => NewIO, '&open' => &open2));
     }
     else {
-        BEGIN Map.new((NewIO => NewIO));
+        BEGIN Map.new((NewIO => NewIO, '&open2' => &open2));
     }
 }
