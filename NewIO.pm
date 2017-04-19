@@ -1,3 +1,4 @@
+use nqp;
 use NativeCall;
 
 my role NewIO { ... }
@@ -110,6 +111,66 @@ my class NewIO::Sys {
 
 my constant sysio = NewIO::Sys;
 
+my class U64Pair is repr<CStruct> {
+    has uint64 $.a is rw;
+    has uint64 $.b is rw;
+}
+
+my role Encoding {
+    method min-bytes-per-code(--> UInt:D) { ... }
+    method max-bytes-per-code(--> UInt:D) { ... }
+    method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
+        uint $srcpos is rw, uint $count --> Nil) { ... }
+}
+
+my class Encoding::Latin1 does Encoding {
+    sub sysenc_decode_latin1(Uni, blob8, U64Pair, uint64) is native<sysenc> {*}
+
+    method min-bytes-per-code(--> UInt:D) { 1 }
+    method max-bytes-per-code(--> UInt:D) { 1 }
+    method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
+        uint $srcpos is rw, uint $count --> Nil) {
+        my $pair := U64Pair.new(a => $dstpos, b => $srcpos);
+        sysenc_decode_latin1($dst, $src, $pair, $count);
+        $dstpos = $pair.a;
+        $srcpos = $pair.b;
+    }
+}
+
+my class Encoding::Utf8 does Encoding {
+    method min-bytes-per-code(--> UInt:D) { 1 }
+    method max-bytes-per-code(--> UInt:D) { 4 }
+    method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
+        uint $srcpos is rw, uint $count --> Nil) {
+        !!!
+    }
+}
+
+my class Encoding::Utf16le does Encoding {
+    method min-bytes-per-code(--> UInt:D) { 2 }
+    method max-bytes-per-code(--> UInt:D) { 4 }
+    method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
+        uint $srcpos is rw, uint $count --> Nil) {
+        !!!
+    }
+}
+
+my class Encoding::Utf16be does Encoding {
+    method min-bytes-per-code(--> UInt:D) { 2 }
+    method max-bytes-per-code(--> UInt:D) { 4 }
+    method decode(Uni:D $dst, blob8:D $src, uint64 $dstpos is rw,
+        uint64 $srcpos is rw, uint64 $count --> Nil) {
+        !!!
+    }
+}
+
+my %ENCODINGS =
+    'latin1'    => Encoding::Latin1,
+    'utf8'      => Encoding::Utf8,
+    'utf16'     => Encoding::Utf16le,
+    'utf16-le'  => Encoding::Utf16le,
+    'utf16-be'  => Encoding::Utf16be;
+
 my role NewIO::Handle {
     method raw(--> NewIO::Handle:D) {
         self.RAW;
@@ -182,6 +243,11 @@ my role NewIO::BufferedHandle {
         self.FILL-BUFFER($n);
         self.TAKE-AVAILABLE-BYTES($n);
     }
+
+    method uniread(UInt:D $n --> Uni:D) {
+        self.FILL-BUFFER($n * self.ENCODING.max-bytes-per-code);
+        self.TAKE-AVAILABLE-CODES($n);
+    }
 }
 
 my role NewIO::StreamingHandle {
@@ -245,9 +311,22 @@ my class NewIO::BufferedOsHandle is NewIO::OsHandle does NewIO::BufferedHandle {
 
     has buf8 $!buffer = buf8.allocate(BLOCKSIZE);
     has uint $!pos;
+    has $.encoding;
+
+    submethod BUILD(:$enc = Encoding::Utf8) {
+        $!encoding = do given $enc {
+            when Encoding { $enc }
+            when %ENCODINGS{$enc}:exists { %ENCODINGS{$enc} }
+            default { die "unsupported encoding '$enc'" }
+        }
+    }
 
     method RAW {
         NewIO::OsHandle.new(:$.fd);
+    }
+
+    method ENCODING {
+        $!encoding;
     }
 
     method AVAILABLE-BYTES {
@@ -280,6 +359,26 @@ my class NewIO::BufferedOsHandle is NewIO::OsHandle does NewIO::BufferedHandle {
 
         $!pos = $rest;
         $buf;
+    }
+
+    method TAKE-AVAILABLE-CODES(UInt:D $n --> Uni:D) {
+        my $enc := self.ENCODING;
+        my uint $count = $n min ($!pos div $enc.min-bytes-per-code);
+
+        my $uni := nqp::create(Uni);
+        nqp::setelems($uni, $count);
+
+        my uint $dstpos;
+        my uint $srcpos;
+
+        $enc.decode($uni, $!buffer, $dstpos, $srcpos, $count);
+        nqp::setelems($uni, $dstpos);
+
+        my uint $rest = $!pos - $srcpos;
+        sysio.move($!buffer, $!buffer, 0, $srcpos, $rest) if $rest > 0;
+        $!pos = $rest;
+
+        $uni;
     }
 }
 
@@ -332,12 +431,14 @@ my class NewIO::Std does NewIO[NewIO::StdHandle] {}
 
 my class NewIO::Path is IO::Path does NewIO[NewIO::FileHandle] {
     multi method slurp(:$bin! --> blob8:D) {
-        my \fd = sysio.open(self.absolute, 0);
-        my \size = sysio.getsize(fd);
-        my \buf = buf8.allocate(size);
-        buf.reallocate(sysio.read(fd, buf, 0, size));
-        sysio.close(fd);
-        buf;
+        my int64 $fd = sysio.open(self.absolute, 0);
+        do {
+            LEAVE sysio.close($fd);
+            my int64 $size = sysio.getsize($fd);
+            my $buf := buf8.allocate($size);
+            $buf.reallocate(sysio.read($fd, $buf, 0, $size));
+            $buf;
+        }
     }
 }
 
