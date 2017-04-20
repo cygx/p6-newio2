@@ -9,6 +9,20 @@ my class X::NewIO::Sys does X::IO {
     }
 }
 
+my class X::Encoding::VariableLength is Exception {
+    has $.name;
+    method message { "$!name is variable-length" }
+}
+
+my class X::Encoding::Unknown is Exception {
+    has $.name;
+    method message { "encoding '$!name' not known" }
+}
+
+my class X::Encoding::PartialInput is Exception {
+    method message { "cannot decode input with partial code units" }
+}
+
 my class NewIO::Sys {
     my constant NUL = "\0";
     my constant ENC = 'utf16';
@@ -117,8 +131,9 @@ my class U64Pair is repr<CStruct> {
 }
 
 my role Encoding {
-    method min-bytes-per-code(--> UInt:D) { ... }
-    method max-bytes-per-code(--> UInt:D) { ... }
+    method LF(--> blob8:D) { ... }
+    method CRLF(--> blob8:D) { ... }
+    method bytes-per-code(--> Range:D) { ... }
     method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
         uint $srcpos is rw, uint $count --> Nil) { ... }
 }
@@ -126,8 +141,9 @@ my role Encoding {
 my class Encoding::Latin1 does Encoding {
     sub sysenc_decode_latin1(Uni, blob8, U64Pair, uint64) is native<sysenc> {*}
 
-    method min-bytes-per-code(--> UInt:D) { 1 }
-    method max-bytes-per-code(--> UInt:D) { 1 }
+    method LF(--> blob8:D) { BEGIN blob8.new(0x0A) }
+    method CRLF(--> blob8:D) { BEGIN blob8.new(0x0D, 0x0A) }
+    method bytes-per-code(--> Range:D) { BEGIN 1..1 }
     method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
         uint $srcpos is rw, uint $count --> Nil) {
         my $pair := U64Pair.new(a => $dstpos, b => $srcpos);
@@ -138,8 +154,9 @@ my class Encoding::Latin1 does Encoding {
 }
 
 my class Encoding::Utf8 does Encoding {
-    method min-bytes-per-code(--> UInt:D) { 1 }
-    method max-bytes-per-code(--> UInt:D) { 4 }
+    method LF(--> blob8:D) { BEGIN blob8.new(0x0A) }
+    method CRLF(--> blob8:D) { BEGIN blob8.new(0x0D, 0x0A) }
+    method bytes-per-code(--> Range:D) { BEGIN 1..4 }
     method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
         uint $srcpos is rw, uint $count --> Nil) {
         !!!
@@ -147,8 +164,9 @@ my class Encoding::Utf8 does Encoding {
 }
 
 my class Encoding::Utf16le does Encoding {
-    method min-bytes-per-code(--> UInt:D) { 2 }
-    method max-bytes-per-code(--> UInt:D) { 4 }
+    method LF(--> blob8:D) { !!! }
+    method CRLF(--> blob8:D) { !!! }
+    method bytes-per-code(--> Range:D) { BEGIN 2..4 }
     method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
         uint $srcpos is rw, uint $count --> Nil) {
         !!!
@@ -156,8 +174,29 @@ my class Encoding::Utf16le does Encoding {
 }
 
 my class Encoding::Utf16be does Encoding {
-    method min-bytes-per-code(--> UInt:D) { 2 }
-    method max-bytes-per-code(--> UInt:D) { 4 }
+    method LF(--> blob8:D) { !!! }
+    method CRLF(--> blob8:D) { !!! }
+    method bytes-per-code(--> Range:D) { BEGIN 2..4 }
+    method decode(Uni:D $dst, blob8:D $src, uint64 $dstpos is rw,
+        uint64 $srcpos is rw, uint64 $count --> Nil) {
+        !!!
+    }
+}
+
+my class Encoding::Utf32le does Encoding {
+    method LF(--> blob8:D) { !!! }
+    method CRLF(--> blob8:D) { !!! }
+    method bytes-per-code(--> Range:D) { BEGIN 4..4 }
+    method decode(Uni:D $dst, blob8:D $src, uint $dstpos is rw,
+        uint $srcpos is rw, uint $count --> Nil) {
+        !!!
+    }
+}
+
+my class Encoding::Utf32be does Encoding {
+    method LF(--> blob8:D) { !!! }
+    method CRLF(--> blob8:D) { !!! }
+    method bytes-per-code(--> Range:D) { BEGIN 4..4 }
     method decode(Uni:D $dst, blob8:D $src, uint64 $dstpos is rw,
         uint64 $srcpos is rw, uint64 $count --> Nil) {
         !!!
@@ -169,7 +208,16 @@ my %ENCODINGS =
     'utf8'      => Encoding::Utf8,
     'utf16'     => Encoding::Utf16le,
     'utf16-le'  => Encoding::Utf16le,
-    'utf16-be'  => Encoding::Utf16be;
+    'utf16-be'  => Encoding::Utf16be,
+    'utf32'     => Encoding::Utf32le,
+    'utf32-le'  => Encoding::Utf32le,
+    'utf32-be'  => Encoding::Utf32be;
+
+sub encoding($_) {
+    when Encoding { $_ }
+    when %ENCODINGS{$_}:exists { %ENCODINGS{$_} }
+    default { fail X::Encoding::Unknown(name => ~$_) }
+}
 
 my role NewIO::Handle {
     method raw(--> NewIO::Handle:D) {
@@ -211,6 +259,26 @@ my role NewIO::Handle {
     method readall(--> blob8:D) {
         self.read(self.GET-SIZE - self.GET-POS);
     }
+
+    method uniread(UInt:D $n, :$enc! --> Uni:D) {
+        my $encoding := encoding $enc;
+        my $range := $encoding.bytes-per-code;
+        die X::Encoding::VariableLength.new(name => $encoding.^name)
+            if $range > 1;
+
+        my uint $unit = $range.max;
+        my $buf := self.read($n * $unit);
+        my uint $len = $buf.elems;
+        die X::Encoding::PartialInput.new
+            unless $len %% $unit;
+
+        my uint $count = $len div $unit;
+        my $uni := nqp::create(Uni);
+        nqp::setelems($uni, $count);
+
+        $encoding.decode($uni, $buf, my uint $, my uint $, $count);
+        $uni;
+    }
 }
 
 my role NewIO::BufferedHandle {
@@ -245,7 +313,7 @@ my role NewIO::BufferedHandle {
     }
 
     method uniread(UInt:D $n --> Uni:D) {
-        self.FILL-BUFFER($n * self.ENCODING.max-bytes-per-code);
+        self.FILL-BUFFER($n * self.ENCODING.bytes-per-code.max);
         self.TAKE-AVAILABLE-CODES($n);
     }
 }
@@ -309,16 +377,16 @@ my class NewIO::BufferedOsHandle is NewIO::OsHandle does NewIO::BufferedHandle {
         (($n + $s - 1) div $s) * $s;
     }
 
+    has $.encoding;
     has buf8 $!buffer = buf8.allocate(BLOCKSIZE);
     has uint $!pos;
-    has $.encoding;
+    has blob8 $!nl-out;
+    has blob8 @!nl-in;
 
     submethod BUILD(:$enc = Encoding::Utf8) {
-        $!encoding = do given $enc {
-            when Encoding { $enc }
-            when %ENCODINGS{$enc}:exists { %ENCODINGS{$enc} }
-            default { die "unsupported encoding '$enc'" }
-        }
+        $!encoding = encoding $enc;
+        $!nl-out = $!encoding.LF;
+        @!nl-in  = $!encoding.CRLF, $!encoding.LF;
     }
 
     method RAW {
@@ -363,7 +431,7 @@ my class NewIO::BufferedOsHandle is NewIO::OsHandle does NewIO::BufferedHandle {
 
     method TAKE-AVAILABLE-CODES(UInt:D $n --> Uni:D) {
         my $enc := self.ENCODING;
-        my uint $count = $n min ($!pos div $enc.min-bytes-per-code);
+        my uint $count = $n min ($!pos div $enc.bytes-per-code.min);
 
         my $uni := nqp::create(Uni);
         nqp::setelems($uni, $count);
