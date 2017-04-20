@@ -23,17 +23,3 @@ do {
     say $end - $start;
     say $i;
 }
-
-do {
-    my $path = NewIO::Path.new(FILE);
-    my $i = 0;
-    my $start = now;
-    for ^N {
-        my $fh := $path.open.raw;
-        $i += $fh.readall.elems;
-        $fh.close;
-    }
-    my $end = now;
-    say $end - $start;
-    say $i;
-}
