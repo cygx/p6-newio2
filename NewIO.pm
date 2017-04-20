@@ -13,7 +13,7 @@ my class X::NewIO::Unsupported does X::IO {
     has $.type;
     has $.operation;
     method message {
-        "$!type does not support operation '$!operation'";
+        "{$!type.^name} does not support operation '$!operation'";
     }
 }
 
@@ -236,9 +236,9 @@ sub encoding($_) {
 }
 
 my role NewIO::Handle {
-    sub UNSUPPORTED($routine) is hidden-from-backtrace {
+    sub UNSUPPORTED($self, $routine) is hidden-from-backtrace {
         die X::NewIO::Unsupported.new(
-            type => ::?CLASS,
+            type => $self.WHAT,
             operation => $routine.name);
     }
 
@@ -248,25 +248,25 @@ my role NewIO::Handle {
     }
 
     method size(--> UInt:D) {
-        UNSUPPORTED &?ROUTINE;
+        UNSUPPORTED self, &?ROUTINE;
     }
 
     proto method seek($) {*}
 
     multi method seek(UInt:D $pos --> True) {
-        UNSUPPORTED &?ROUTINE;
+        UNSUPPORTED self, &?ROUTINE;
     }
 
     multi method seek(WhateverCode $pos --> True) {
-        UNSUPPORTED &?ROUTINE;
+        UNSUPPORTED self, &?ROUTINE;
     }
 
     method skip(Int:D $offset --> True) {
-        UNSUPPORTED &?ROUTINE;
+        UNSUPPORTED self, &?ROUTINE;
     }
 
     method tell(--> UInt:D) {
-        UNSUPPORTED &?ROUTINE;
+        UNSUPPORTED self, &?ROUTINE;
     }
 
     method read(UInt:D $n --> blob8:D) {
@@ -277,7 +277,7 @@ my role NewIO::Handle {
     }
 
     method readall(Bool :$close --> blob8:D) {
-        UNSUPPORTED &?ROUTINE;
+        UNSUPPORTED self, &?ROUTINE;
     }
 }
 
