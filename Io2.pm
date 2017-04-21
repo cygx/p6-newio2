@@ -1,6 +1,7 @@
 use NativeCall;
 use nqp;
 
+my constant intptr = ssize_t;
 my class Io2 is repr<Uninstantiable> { ... }
 
 my class X::Io2::Sys is Exception {
@@ -9,22 +10,60 @@ my class X::Io2::Sys is Exception {
     method message { "$!kind error: $!oserror" }
 }
 
-my class Io2::Buffer is repr<CStruct> {
-    my constant intptr = ssize_t;
+my class Io2 {
+    my constant SYSENC = 'utf16';
+    my constant ERROR_MAX = 512;
+    my constant NUL = "\0";
+    my constant INVALID_FD = -1;
 
+    sub oserror(buf8, uint32 --> uint32)
+        is native<p6io2> is symbol<p6io2_oserror> {*}
+
+    sub open(Str is encoded(SYSENC), uint32 --> intptr)
+        is native<p6io2> is symbol<p6io2_open> {*}
+
+    sub close(intptr --> int32)
+        is native<p6io2> is symbol<p6io2_close> {*}
+
+    sub stdhandle(uint32 $id --> intptr)
+        is native<p6io2> is symbol<p6io2_stdhandle> {*}
+
+    method oserror(--> Str:D) {
+        my $buf := buf8.allocate(ERROR_MAX);
+        $buf.reallocate(oserror($buf, $buf.elems));
+        $buf.decode(SYSENC).chomp;
+    }
+
+    method open(Str:D $path, uint32 $mode --> intptr) {
+        my intptr $fd = open($path ~ NUL, $mode);
+        die X::Io2::Sys.new if $fd == INVALID_FD;
+        $fd;
+    }
+
+    method close(intptr $fd --> Nil) {
+        close($fd) == 0 or die X::Io2::Sys.new;
+    }
+
+    method stdin  { stdhandle(0) }
+    method stdout { stdhandle(1) }
+    method stderr { stdhandle(2) }
+}
+
+my class Io2::Buffer is repr<CStruct> {
     has intptr $.bytes;
     has uint32 $.size;
     has uint32 $.pos;
 
-    method RESIZE($size) {
-        $!bytes = Io2.realloc($.bytes(:ptr), $size);
-        $!size = $size;
-    }
+    method bytes { nativecast(CArray[uint8], $.bytes(:ptr)) }
 
-    method DISCARD {
-        Io2.free($.bytes(:ptr));
-        $!size = 0;
-    }
+    method resize(uint32 $size)
+        is native<p6io2> is symbol<p6io2_buffer_resize> {*}
+
+    method discard()
+        is native<p6io2> is symbol<p6io2_buffer_discard> {*}
+
+    method fill(intptr $fd, bool $retry --> int32)
+        is native<p6io2> is symbol<p6io2_buffer_fill> {*}
 
     submethod wrap(buf8:D $buf) {
         self.new(
@@ -32,9 +71,6 @@ my class Io2::Buffer is repr<CStruct> {
             bytes => nativecast(Pointer, $buf)
         );
     }
-
-    multi method bytes { nativecast(CArray[uint8], $.bytes(:ptr)) }
-    multi method bytes(:$ptr!) { nqp::box_i($!bytes, Pointer) }
 }
 
 my class Io2::DynBuffer is repr<CStruct> is Io2::Buffer {
@@ -44,99 +80,34 @@ my class Io2::DynBuffer is repr<CStruct> is Io2::Buffer {
     has uint32 $.blocksize = BLOCKSIZE;
     has uint32 $.limit = LIMIT;
 
-    submethod TWEAK { self.RESIZE($!blocksize) }
+    submethod TWEAK { self.resize($!blocksize) }
+
+    method drain(Io2::Buffer $buf)
+        is native<p6io2> is symbol<p6io2_dynbuffer_drain> {*}
+
+    method refill(intptr $fd, uint32 $n, bool $retry --> int32)
+        is native<p6io2> is symbol<p6io2_dynbuffer_refill> {*}
 }
 
-my class Io2::Encoding is repr<CPointer> {
-    method utf8 { INIT Io2::Encoding }
-    method latin1 { INIT Io2::Encoding }
-}
-
-my class Io2 {
-    my constant SYSENC = 'utf16';
-    my constant LIBC = 'msvcrt';
-    my constant ERROR_MAX = 512;
-    my constant NUL = "\0";
-    my constant INVALID_FD = -1;
-    my constant INVALID_READ = 0xFF_FF_FF_FF;
-
-    sub malloc(size_t --> Pointer) is native(LIBC) {*}
-    sub realloc(Pointer, size_t --> Pointer) is native(LIBC) {*}
-    sub free(Pointer) is native(LIBC) {*}
-
-    sub oserror(buf8, uint32 --> uint32)
-        is native<p6io2> is symbol<p6io2_oserror> {*}
-
-    sub sysopen(Str is encoded(SYSENC), uint32 --> int64)
-        is native<p6io2> is symbol<p6io2_sysopen> {*}
-
-    sub close(int64 --> int32)
-        is native<p6io2> is symbol<p6io2_close> {*}
-
-    sub stdhandle(uint32 $id --> int64)
-        is native<p6io2> is symbol<p6io2_stdhandle> {*}
-
-    sub read(int64 $fd, Io2::Buffer:D $buf, uint32 $n --> uint32)
-        is native<p6io2> is symbol<p6io2_read> {*}
-
-    method malloc($size) { malloc($size) }
-    method realloc($ptr, $size) { realloc($ptr, $size) }
-    method free($ptr) { free($ptr) }
-
-    method oserror(--> Str:D) {
-        my $buf := buf8.allocate(ERROR_MAX);
-        $buf.reallocate(oserror($buf, $buf.elems));
-        $buf.decode(SYSENC).chomp;
-    }
-
-    method sysopen(Str:D $path, uint32 $mode --> int64) {
-        my int64 $fd = sysopen($path ~ NUL, $mode);
-        die X::Io2::Sys.new if $fd == INVALID_FD;
-        $fd;
-    }
-
-    method close(int64 $fd --> Nil) {
-        die X::Io2::Sys.new
-            if close($fd) < 0;
-    }
-
-    method read(int64 $fd, Io2::Buffer:D $buf, uint32 $n --> uint32) {
-        my uint32 $rv = read($fd, $buf, $n);
-        die X::Io2::Sys.new if $rv == INVALID_READ;
-        $rv;
-    }
-
-    method stdin  { stdhandle(0) }
-    method stdout { stdhandle(1) }
-    method stderr { stdhandle(2) }
-}
-
-my class Io2::OsHandle {
-    has int64 $.fd;
-
-    method CLOSE { Io2.close($!fd) }
-
-    method READ(Io2::Buffer:D $buf, uint32 $n --> uint32) {
-        Io2.read($!fd, $buf, $n);
-    }
-
-    method close { self.CLOSE }
-
-    method read(uint32 $n --> buf8:D) {
-        my $buf := buf8.allocate($n);
-        $buf.reallocate(self.READ(Io2::Buffer.wrap($buf), $n) || return Nil);
-        $buf;
-    }
-}
-
-my class Io2::BufferedOsHandle is Io2::OsHandle {
+my class Io2::Handle {
+    has intptr $.fd;
     has Io2::DynBuffer $.buffer = Io2::DynBuffer.new;
-    has Io2::Encoding $.encoding = Io2::Encoding.utf8;
 
     method close {
-        $!buffer.DISCARD;
-        self.CLOSE;
+        $!buffer.discard;
+        Io2.close($!fd);
+    }
+
+    method read(uint32 $n, Bool :$retry = False --> buf8:D) {
+        my $buf := buf8.allocate($n);
+        return $buf if $n == 0;
+
+        my $stooge := Io2::Buffer.wrap($buf);
+        $!buffer.drain($stooge);
+        $stooge.fill($!fd, $retry) >= 0
+            or die X::Io2::Sys.new;
+
+        $buf.reallocate($stooge.pos);
+        $buf || Nil;
     }
 }
-
-say Io2::OsHandle.new(fd => Io2.stdin).read(100).decode.perl;
