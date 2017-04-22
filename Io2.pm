@@ -28,6 +28,12 @@ my class Io2 {
     sub stdhandle(uint32 $id --> intptr)
         is native<p6io2> is symbol<p6io2_stdhandle> {*}
 
+    sub getsize(intptr --> int64)
+        is native<p6io2> is symbol<p6io2_getsize> {*}
+
+    sub getpos(intptr --> int64)
+        is native<p6io2> is symbol<p6io2_getpos> {*}
+
     method oserror(--> Str:D) {
         my $buf := buf8.allocate(ERROR_MAX);
         $buf.reallocate(oserror($buf, $buf.elems));
@@ -44,9 +50,39 @@ my class Io2 {
         close($fd) == 0 or die X::Io2::Sys.new;
     }
 
+    method getsize(intptr $fd --> uint64) {
+        my int64 $size = getsize($fd);
+        die X::Io2::Sys.new if $size == -1;
+        $size;
+    }
+
+    method getpos(intptr $fd --> uint64) {
+        my int64 $pos = getpos($fd);
+        die X::Io2::Sys.new if $pos == -1;
+        $pos;
+    }
+
     method stdin  { stdhandle(0) }
     method stdout { stdhandle(1) }
     method stderr { stdhandle(2) }
+
+    method mode(
+        :$r, :$u, :$w, :$a, :$x, :$ru, :$rw, :$ra, :$rx,
+        :$read is copy, :$write is copy, :$append is copy,
+        :$create is copy, :$exclusive is copy, :$truncate is copy
+    ) {
+        $read = True if $r;
+        $write = True if $u;
+        $write = $create = $truncate = True if $w;
+        $write = $create = $append = True if $a;
+        $write = $create = $exclusive = True if $x;
+        $read = $write = True if $ru;
+        $read = $write = $create = $truncate = True if $rw;
+        $read = $write = $create = $append = True if $ra;
+        $read = $write = $create = $exclusive = True if $rx;
+        ?$read +| ?$write +< 1 +| ?$append +< 2
+            +| ?$create +< 3 +| ?$exclusive +< 4 +| ?$truncate +< 5;
+    }
 }
 
 my class Io2::Buffer is repr<CStruct> {
@@ -64,6 +100,13 @@ my class Io2::Buffer is repr<CStruct> {
 
     method fill(intptr $fd, bool $retry --> int32)
         is native<p6io2> is symbol<p6io2_buffer_fill> {*}
+
+    method shift(uint32 $count)
+        is native<p6io2> is symbol<p6io2_buffer_shift> {*}
+
+    method clear(--> Nil) {
+        $!pos = 0;
+    }
 
     submethod wrap(buf8:D $buf) {
         self.new(
@@ -111,3 +154,48 @@ my class Io2::Handle {
         $buf || Nil;
     }
 }
+
+my class Io2::FileHandle is Io2::Handle {
+    has Str $.path;
+    has uint32 $.mode;
+
+    method size(--> uint64) {
+        Io2.getsize($.fd);
+    }
+
+    method tell(--> uint64) {
+        Io2.getpos($.fd) - $.buffer.pos;
+    }
+
+    method readall(Bool :$close = False --> buf8:D) {
+        LEAVE self.close if $close;
+        self.read(self.size - self.tell);
+    }
+
+    proto method seek($) {*}
+
+    multi method seek(uint64 $pos --> True) {
+        Io2.setpos($.fd, $pos, 0);
+        $.buffer.clear;
+    }
+
+    multi method seek(WhateverCode $pos --> True) {
+        Io2.setpos($.fd, $pos(0), 2);
+        $.buffer.clear;
+    }
+
+    method skip(int64 $offset --> True) {
+        when $offset == 0 {}
+        when 0 < $offset <= $.buffer.pos {
+            $.buffer.shift($offset);
+        }
+        default {
+            Io2.setpos($.fd, $offset - $.buffer.pos, 1);
+            $.buffer.clear;
+        }
+    }
+}
+
+my class Io2::StreamHandle is Io2::Handle {}
+
+say Io2::FileHandle.new(fd => Io2.open('.gitignore', 0)).readall.decode.perl;
